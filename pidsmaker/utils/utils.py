@@ -701,3 +701,30 @@ def get_multi_datasets(cfg):
         map(lambda x: x.strip(), multi_dataset.split("," if "," in multi_dataset else "-"))
     )
     return [cfg.dataset.name] + [d for d in multi_datasets if d != cfg.dataset.name]
+
+
+def reset_peak_rss():
+    import gc
+    gc.collect()
+    try:
+        with open("/proc/self/clear_refs", "w") as f:
+            f.write("5\n")
+    except OSError:
+        pass
+
+
+def get_rss_gib():
+    """Return (current_rss_gib, peak_hwm_gib) from /proc/self/status."""
+    import resource
+    rss, hwm = None, None
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split(":")[1].strip().split()[0]) / (1024 ** 2)
+                elif line.startswith("VmHWM:"):
+                    hwm = int(line.split(":")[1].strip().split()[0]) / (1024 ** 2)
+    except OSError:
+        pass
+    fallback = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 2)
+    return (rss if rss is not None else fallback), (hwm if hwm is not None else fallback)

@@ -26,7 +26,7 @@ from pidsmaker.factory import (
 )
 from pidsmaker.tasks.batching import get_preprocessed_graphs
 from pidsmaker.utils.data_utils import save_model
-from pidsmaker.utils.utils import get_device, log, log_start, log_tqdm, set_seed
+from pidsmaker.utils.utils import get_device, get_rss_gib, log, log_start, log_tqdm, reset_peak_rss, set_seed
 
 from . import inference_loop
 
@@ -120,9 +120,9 @@ def main(cfg):
         best_val_score, best_model, best_epoch = float("-inf"), None, None
 
         if not cfg._from_weights and (not use_few_shot or (use_few_shot and epoch > 0)):
+            reset_peak_rss()
             start = timer()
             tracemalloc.start()
-
             # Before each epoch, we reset the memory
             model.reset_state()
             model.to_fine_tuning(False)
@@ -167,8 +167,9 @@ def main(cfg):
             tot_loss /= sum(len(dataset) for dataset in train_data)
             epoch_times.append(timer() - start)
 
+            _, hwm_train = get_rss_gib()
             _, peak_inference_cpu_memory = tracemalloc.get_traced_memory()
-            peak_train_cpu_mem = max(peak_train_cpu_mem, peak_inference_cpu_memory / (1024**3))
+            peak_train_cpu_mem = max(peak_train_cpu_mem, hwm_train, peak_inference_cpu_memory / (1024**3))
             tracemalloc.stop()
 
             if use_cuda:
@@ -305,25 +306,40 @@ def main(cfg):
             epoch=best_epoch,
             split="test",
         )
+        all_test_stats.append(test_stats)
 
-    wandb.log(
-        {
-            "best_epoch": best_epoch,
-            "train_epoch_time": round(np.mean(epoch_times), 2),
-            "val_score": round(best_val_score, 5),
-            "peak_train_cpu_memory": round(peak_train_cpu_mem, 3),
-            "peak_train_gpu_memory": round(peak_train_gpu_mem, 3),
-            "peak_inference_cpu_memory": round(
-                np.max([d["peak_inference_cpu_memory"] for d in all_test_stats]), 3
-            ),
-            "peak_inference_gpu_memory": round(
-                np.max([d["peak_inference_gpu_memory"] for d in all_test_stats]), 3
-            ),
-            "time_per_batch_inference": round(
-                np.mean([d["time_per_batch_inference"] for d in all_test_stats]), 3
-            ),
-        }
-    )
+    # Free training-only data (train_data, val_data, optimizer) to measure clean serving baseline RSS
+    del train_data, val_data, optimizer
+    reset_peak_rss()
+    serving_base_rss_gib, _ = get_rss_gib()
+    max_infer_delta_gib = max((d.get("peak_inference_delta_rss_gib", 0.0) for d in all_test_stats), default=0.0)
+    serving_peak_rss_gib = round(serving_base_rss_gib + max_infer_delta_gib, 4)
+    training_peak_rss_gib = round(float(peak_train_cpu_mem), 4)
+    gnn_train_sec = round(float(np.sum(epoch_times)), 4) if epoch_times else 0.0
+    test_infer_times = [d["test_inference_time_seconds"] for d in all_test_stats if d.get("test_inference_time_seconds", 0.0) > 0]
+    infer_sec = round(float(np.mean(test_infer_times)), 4) if test_infer_times else 0.0
+
+    eff_stats = {
+        "best_epoch": best_epoch,
+        "train_epoch_time": round(float(np.mean(epoch_times)), 2) if epoch_times else 0.0,
+        "val_score": round(float(best_val_score), 5),
+        "training_runtime_seconds": gnn_train_sec,
+        "inference_runtime_seconds": infer_sec,
+        "training_peak_rss_gib": training_peak_rss_gib,
+        "serving_peak_rss_gib": serving_peak_rss_gib,
+        "peak_train_cpu_memory": round(float(peak_train_cpu_mem), 3),
+        "peak_train_gpu_memory": round(float(peak_train_gpu_mem), 3),
+        "peak_inference_cpu_memory": serving_peak_rss_gib,
+        "peak_inference_gpu_memory": round(
+            float(np.max([d["peak_inference_gpu_memory"] for d in all_test_stats])), 3
+        ) if all_test_stats else 0.0,
+        "time_per_batch_inference": round(
+            float(np.mean([d["time_per_batch_inference"] for d in all_test_stats])), 5
+        ) if all_test_stats else 0.0,
+    }
+    os.makedirs(cfg.training._task_path, exist_ok=True)
+    torch.save(eff_stats, os.path.join(cfg.training._task_path, "efficiency_stats.pth"))
+    wandb.log(eff_stats)
 
     return best_val_score
 

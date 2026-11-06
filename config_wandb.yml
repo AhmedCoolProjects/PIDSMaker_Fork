@@ -1,0 +1,61 @@
+wandb:
+  project: pidsmaker
+  groups:
+    - name: "{method}"
+  runs:
+    - name: baseline
+  metrics:
+    - name: adp_score
+    - name: fscore
+    - name: f1
+    - name: precision
+    - name: recall
+    - name: fpr
+    - name: tp
+    - name: fp
+    - name: tn
+    - name: fn
+    - name: auc
+    - name: ap
+    - name: accuracy
+    - name: balanced_acc
+    - name: mcc
+    - name: lr(+)
+    - name: dor
+    - name: threshold
+    - name: discrimination
+    - name: percent_detected_attacks
+    - name: fp_in_malicious_tw_ratio
+    - name: fps_if_all_attacks_detected
+    - name: tps_if_all_attacks_detected
+    - name: precision_if_all_attacks_detected
+    - name: recall_if_all_attacks_detected
+    - name: ap@10
+    - name: ap@50
+    - name: ap@100
+    - name: precision@10
+    - name: precision@50
+    - name: precision@100
+    - name: recall@10
+    - name: recall@50
+    - name: recall@100
+    - name: best_epoch
+    - name: val_score
+  efficiency_metrics:
+    - name: training_runtime_seconds
+    - name: inference_runtime_seconds
+    - name: training_peak_rss_gib
+    - name: serving_peak_rss_gib
+    - name: total_runtime_seconds
+    - name: peak_rss_gib
+    - name: train_epoch_time
+    - name: time_construction
+    - name: time_transformation
+    - name: time_featurization
+    - name: time_feat_inference
+    - name: time_batching
+    - name: time_training
+    - name: time_evaluation
+    - name: time_triage
+  api_key_name: WANDB_API_KEY
+  api_key_path: .env.local

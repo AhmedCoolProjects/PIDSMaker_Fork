@@ -12,9 +12,11 @@ from sklearn.neighbors import NearestNeighbors
 from pidsmaker.utils.utils import (
     calculate_average_from_file,
     get_device,
+    get_rss_gib,
     log,
     log_tqdm,
     ns_time_to_datetime_US,
+    reset_peak_rss,
     set_seed,
 )
 
@@ -35,9 +37,12 @@ def test_edge_level(
 
     validation = split == "val"
 
+    t0 = time.perf_counter()
     results = model(data, inference=True, validation=validation)
     each_edge_loss = results["loss"]
-    all_losses.extend(each_edge_loss.cpu().numpy().tolist())
+    losses = each_edge_loss.cpu().numpy()
+    infer_sec = time.perf_counter() - t0
+    all_losses.extend(losses.tolist())
 
     # If the data has been reindexed in the loader or batched, we retrieve original node IDs
     # to later find the labels
@@ -46,7 +51,6 @@ def test_edge_level(
     srcnodes = edge_index[0, :].cpu().numpy()
     dstnodes = edge_index[1, :].cpu().numpy()
     t_vars = data.t.cpu().numpy()
-    losses = each_edge_loss.cpu().numpy()
     edge_types = (data.edge_type.max(dim=1).indices + 1).cpu().numpy()
 
     # if 1 in data.y:
@@ -73,7 +77,7 @@ def test_edge_level(
     csv_file = os.path.join(logs_dir, time_interval + ".csv")
 
     edge_df.to_csv(csv_file, sep=",", header=True, index=False, encoding="utf-8")
-    return all_losses
+    return all_losses, infer_sec
 
 
 @torch.no_grad()
@@ -94,11 +98,14 @@ def test_node_level(
 
     validation = split == "val"
 
+    t0 = time.perf_counter()
     data = data.to(device)
 
     results = model(data, inference=True, validation=validation)
     loss = results["loss"]
-    losses.extend(loss.cpu().numpy().tolist())
+    loss_np = loss.cpu().numpy()
+    infer_sec = time.perf_counter() - t0
+    losses.extend(loss_np.tolist())
     n_id = getattr(data, "original_n_id_tgn", getattr(data, "original_n_id"))
 
     # ThreaTrace code
@@ -254,7 +261,7 @@ def test_node_level(
 
     df = pd.DataFrame(node_list)
     df.to_csv(csv_file, sep=",", header=True, index=False, encoding="utf-8")
-    return losses
+    return losses, infer_sec
 
 
 def main(cfg, model, val_data, test_data, epoch, split, logging=True, train_data=None):
@@ -286,24 +293,28 @@ def main(cfg, model, val_data, test_data, epoch, split, logging=True, train_data
         torch.cuda.reset_peak_memory_stats(device=device)
 
     val_score = 0.0
-    peak_inference_cpu_mem = 0
-    peak_inference_gpu_mem = 0
+    peak_inference_cpu_mem = 0.0
+    peak_inference_gpu_mem = 0.0
+    peak_inference_delta_rss_gib = 0.0
     tpb = []
+    split_infer_sec = {}
     split2loss = {}
 
     for dataset, split_name in splits:
         desc = "Validation" if split_name == "val" else "Testing"
 
+        reset_peak_rss()
+        rss_before, _ = get_rss_gib()
         tracemalloc.start()
 
         all_losses = []
+        split_tpb = []
         for graphs in dataset:
             for g in log_tqdm(graphs, desc=desc, logging=logging):
                 g.to(device=device)
 
-                s = time.time()
                 test_fn = test_node_level if (cfg._is_node_level and not cfg._is_hybrid_loss) else test_edge_level
-                losses = test_fn(
+                losses, infer_sec = test_fn(
                     data=g,
                     model=model,
                     split=split_name,
@@ -312,21 +323,25 @@ def main(cfg, model, val_data, test_data, epoch, split, logging=True, train_data
                     device=device,
                 )
                 all_losses.extend(losses)
-                tpb.append(time.time() - s)
+                split_tpb.append(infer_sec)
+                tpb.append(infer_sec)
 
                 g.to("cpu")  # Move graph back to CPU to free GPU memory for next batch
                 if use_cuda:
                     torch.cuda.empty_cache()
 
-        _, peak_inference_cpu_memory = tracemalloc.get_traced_memory()
-        peak_inference_cpu_mem = max(peak_inference_cpu_mem, peak_inference_cpu_memory / (1024**3))
+        split_infer_sec[split_name] = float(np.sum(split_tpb)) if split_tpb else 0.0
+        _, hwm_after = get_rss_gib()
+        _, traced_peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
+        delta_rss = max(0.0, hwm_after - rss_before, traced_peak / (1024**3))
+        peak_inference_delta_rss_gib = max(peak_inference_delta_rss_gib, delta_rss)
+        peak_inference_cpu_mem = max(peak_inference_cpu_mem, hwm_after)
 
         if use_cuda:
             peak_inference_gpu_memory = torch.cuda.max_memory_allocated(device=device) / (1024**3)
             peak_inference_gpu_mem = max(peak_inference_gpu_mem, peak_inference_gpu_memory)
             torch.cuda.reset_peak_memory_stats(device=device)
-
         mean_loss = np.mean(all_losses)
         split2loss[split_name] = mean_loss
 
@@ -351,7 +366,10 @@ def main(cfg, model, val_data, test_data, epoch, split, logging=True, train_data
         "val_loss": split2loss.get("val", None),
         "test_loss": split2loss.get("test", None),
         "peak_inference_cpu_memory": peak_inference_cpu_mem,
+        "peak_inference_delta_rss_gib": peak_inference_delta_rss_gib,
         "peak_inference_gpu_memory": peak_inference_gpu_mem,
-        "time_per_batch_inference": np.mean(tpb),
+        "time_per_batch_inference": float(np.mean(tpb)) if tpb else 0.0,
+        "val_inference_time_seconds": split_infer_sec.get("val", 0.0),
+        "test_inference_time_seconds": split_infer_sec.get("test", 0.0),
     }
     return stats

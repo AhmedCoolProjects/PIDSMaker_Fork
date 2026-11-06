@@ -12,12 +12,14 @@ featurization → feat_inference → batching → training → evaluation → tr
 import argparse
 import copy
 import os
+import resource
 import shutil
 import time
 from collections import defaultdict
 
 import torch
 import wandb
+import yaml
 
 from pidsmaker.config import (
     get_runtime_required_args,
@@ -49,7 +51,7 @@ from pidsmaker.tasks import (
     transformation,
     triage,
 )
-from pidsmaker.utils.utils import log, remove_underscore_keys, set_seed
+from pidsmaker.utils.utils import get_rss_gib, log, remove_underscore_keys, reset_peak_rss, set_seed
 
 
 def get_task_to_module(cfg):
@@ -111,6 +113,48 @@ def clean_cfg_for_log(cfg):
     )
 
 
+def _peak_rss_gib():
+    return round(get_rss_gib()[1], 4)
+
+
+def _load_wandb_cfg(args):
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg_path = os.path.join(root_dir, "config_wandb.yml")
+    if not os.path.exists(cfg_path):
+        return {}
+    with open(cfg_path, "r") as f:
+        wcfg = (yaml.safe_load(f) or {}).get("wandb", {}) or {}
+
+    key_name = wcfg.get("api_key_name", "WANDB_API_KEY")
+    env_rel = wcfg.get("api_key_path", ".env.local")
+    env_path = env_rel if os.path.isabs(env_rel) else os.path.join(root_dir, env_rel)
+    if key_name and os.path.exists(env_path):
+        with open(env_path, "r") as ef:
+            for line in ef:
+                line = line.strip()
+                if line.startswith(f"{key_name}="):
+                    os.environ[key_name] = line.split("=", 1)[1].strip().strip("'\"")
+                    break
+    return wcfg
+
+
+def _load_cached_eval_stats(cfg):
+    out_dir = cfg.evaluation._precision_recall_dir
+    if not os.path.exists(out_dir):
+        return {}
+    best_metrics = {
+        "adp_score": float("-inf"),
+        "discrimination": float("-inf"),
+        "ap@10": float("-inf"),
+        "stats": {},
+    }
+    for fname in sorted(os.listdir(out_dir)):
+        if fname.startswith("stats_") and fname.endswith(".pth"):
+            st = torch.load(os.path.join(out_dir, fname), map_location="cpu")
+            best_metrics = evaluation.best_metric_pick_best_epoch(st, best_metrics, cfg)
+    return best_metrics.get("stats") or {}
+
+
 def main(cfg, project=None, exp=None, sweep_id=None, **kwargs):
     """Main execution function for PIDSMaker pipeline.
 
@@ -138,6 +182,7 @@ def main(cfg, project=None, exp=None, sweep_id=None, **kwargs):
         Returns:
             dict: Contains 'time' (execution time) and 'return' (task result)
         """
+        reset_peak_rss()
         start = time.time()
         return_value = None
 
@@ -157,8 +202,10 @@ def main(cfg, project=None, exp=None, sweep_id=None, **kwargs):
         if should_restart[task]:
             return_value = module.main(cfg)
             set_task_to_done(task_path)
+        elif task == "evaluation":
+            return_value = _load_cached_eval_stats(cfg)
 
-        return {"time": time.time() - start, "return": return_value}
+        return {"time": time.time() - start, "rss_gib": _peak_rss_gib(), "return": return_value}
 
     def run_pipeline(cfg, method=None, iteration=None):
         """Execute complete pipeline: all 8 tasks from construction to triage.
@@ -174,15 +221,30 @@ def main(cfg, project=None, exp=None, sweep_id=None, **kwargs):
         tasks = get_task_to_module(cfg).keys()
         task_results = {task: run_task(task, cfg, method, iteration) for task in tasks}
 
-        metrics = task_results["evaluation"]["return"] or {}
-        metrics = {
-            **metrics,
-            "val_score": task_results["training"]["return"],
-        }
+        metrics = dict(task_results["evaluation"]["return"] or {})
+        if "fscore" in metrics and "f1" not in metrics:
+            metrics["f1"] = metrics["fscore"]
+        for k in ("tp", "fp", "tn", "fn"):
+            if k in metrics and metrics[k] is not None:
+                metrics[k] = int(metrics[k])
+        metrics["val_score"] = task_results["training"]["return"]
 
         times = {
             f"time_{task}": round(results["time"], 2) for task, results in task_results.items()
         }
+        train_tasks = ("construction", "transformation", "featurization", "feat_inference", "batching", "training")
+        infer_tasks = ("evaluation", "triage")
+        times["training_runtime_seconds"] = round(sum(task_results[t]["time"] for t in train_tasks if t in task_results), 2)
+        times["inference_runtime_seconds"] = round(sum(task_results[t]["time"] for t in infer_tasks if t in task_results), 2)
+        times["total_runtime_seconds"] = round(sum(r["time"] for r in task_results.values()), 2)
+        times["training_peak_rss_gib"] = max((task_results[t]["rss_gib"] for t in train_tasks if t in task_results), default=0.0)
+        times["serving_peak_rss_gib"] = max((task_results[t]["rss_gib"] for t in infer_tasks if t in task_results), default=0.0)
+        times["peak_rss_gib"] = max((r["rss_gib"] for r in task_results.values()), default=0.0)
+
+        eff_path = os.path.join(cfg.training._task_path, "efficiency_stats.pth")
+        if os.path.exists(eff_path):
+            eff_stats = torch.load(eff_path, map_location="cpu")
+            times.update(eff_stats)
         return metrics, times
 
     def run_pipeline_with_experiments(cfg):
@@ -202,6 +264,10 @@ def main(cfg, project=None, exp=None, sweep_id=None, **kwargs):
             metrics, times = run_pipeline(cfg)
             wandb.log(metrics)
             wandb.log(times)
+            if wandb.run is not None:
+                for k, v in {**metrics, **times}.items():
+                    if isinstance(v, (int, float, str, bool)) or hasattr(v, "item"):
+                        wandb.run.summary[k] = v.item() if hasattr(v, "item") else v
 
         elif cfg.experiment.used_method == "uncertainty":
             log("Running pipeline in 'Uncertainty' mode.")
@@ -320,16 +386,32 @@ def main(cfg, project=None, exp=None, sweep_id=None, **kwargs):
 if __name__ == "__main__":
     args, unknown_args = get_runtime_required_args(return_unknown_args=True)
 
+    wcfg = _load_wandb_cfg(args)
+    fmt_ctx = {"method": args.model, "model": args.model, "dataset": args.dataset}
+
+    project_name = (
+        args.project
+        if args.project != "PIDSMaker"
+        else wcfg.get("project", args.project)
+    )
+    groups = wcfg.get("groups") or []
+    group_tpl = groups[0].get("name") if groups and isinstance(groups[0], dict) else None
+    group_name = group_tpl.format(**fmt_ctx) if group_tpl else None
+
+    runs_cfg = wcfg.get("runs") or []
+    run_tpl = runs_cfg[0].get("name") if runs_cfg and isinstance(runs_cfg[0], dict) else None
+    default_run_name = run_tpl.format(**fmt_ctx) if run_tpl else f"{args.dataset}_{args.model}"
     exp_name = (
         args.exp.replace("dataset", args.dataset)
         if args.exp != ""
-        else f"{args.dataset}_{args.model}"
+        else default_run_name
     )
-    tags = args.tags.split(",") if args.tags != "" else [args.model]
+    tags = args.tags.split(",") if args.tags != "" else [args.model, args.dataset]
 
     wandb.init(
         mode=("online" if (args.wandb and args.tuning_mode == "none") else "disabled"),
-        project=args.project,
+        project=project_name,
+        group=group_name,
         name=exp_name,
         tags=tags,
     )
